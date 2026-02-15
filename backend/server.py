@@ -1,5 +1,5 @@
 """
-AI MINDS — Unified Flask API Server.
+GigaMind — Unified Flask API Server.
 
 Serves:
   - Browser extension endpoints (web clip ingestion, element extraction)
@@ -139,6 +139,19 @@ def query():
     return jsonify(result)
 
 
+@app.route("/query/image", methods=["POST"])
+def query_image():
+    """Search for images similar to the provided query image."""
+    payload = request.get_json(force=True)
+    image_path = (payload.get("image_path") or "").strip()
+    if not image_path:
+        return jsonify({"error": "image_path is required"}), 400
+    top_k = int(payload.get("top_k", 6))
+    result = engine.find_similar_images(image_path=image_path, top_k=top_k)
+    code = 200 if result.get("status") != "error" else 400
+    return jsonify(result), code
+
+
 @app.route("/answer", methods=["GET", "POST"])
 def answer_compat():
     """Legacy-compatible answer endpoint."""
@@ -254,8 +267,72 @@ def actions():
 
 @app.route("/actions/<action_id>/done", methods=["POST"])
 def mark_done(action_id):
-    engine.mark_action_done(action_id)
-    return jsonify({"status": "ok"})
+    updated = engine.mark_action_done(action_id)
+    return jsonify({"status": "ok", "updated": updated})
+
+
+@app.route("/actions/cleanup", methods=["POST"])
+def cleanup_actions():
+    result = engine.cleanup_actions()
+    return jsonify(result)
+
+
+@app.route("/actions/purge", methods=["POST"])
+def purge_actions():
+    result = engine.purge_actions()
+    return jsonify(result)
+
+
+# ── Chat Sessions (Persistent) ─────────────────────────────────────────────
+
+@app.route("/chat/sessions", methods=["GET"])
+def chat_sessions_list():
+    sessions = engine.list_chat_sessions()
+    return jsonify(sessions)
+
+
+@app.route("/chat/sessions", methods=["POST"])
+def chat_sessions_create():
+    payload = request.get_json(silent=True) or {}
+    title = payload.get("title")
+    session = engine.create_chat_session(title=title)
+    return jsonify(session)
+
+
+@app.route("/chat/sessions/<session_id>", methods=["DELETE"])
+def chat_sessions_delete(session_id):
+    result = engine.delete_chat_session(session_id)
+    code = 200 if result.get("status") == "ok" else 404
+    return jsonify(result), code
+
+
+@app.route("/chat/sessions/<session_id>/messages", methods=["GET"])
+def chat_messages_get(session_id):
+    session = engine.ensure_chat_session(session_id)
+    messages = engine.get_chat_messages(session["id"])
+    return jsonify({"session": session, "messages": messages})
+
+
+@app.route("/chat/sessions/<session_id>/messages", methods=["POST"])
+def chat_messages_add(session_id):
+    payload = request.get_json(force=True)
+    role = (payload.get("role") or "").strip()
+    content = (payload.get("content") or "").strip()
+    if role not in {"user", "assistant", "system"}:
+        return jsonify({"error": "role must be one of user, assistant, system"}), 400
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+
+    confidence = payload.get("confidence")
+    references = payload.get("references") if isinstance(payload.get("references"), list) else []
+    saved = engine.save_chat_message(
+        session_id=session_id,
+        role=role,
+        content=content,
+        confidence=confidence,
+        references=references,
+    )
+    return jsonify(saved)
 
 
 # ── Automations ──────────────────────────────────────────────────────────────
@@ -311,6 +388,6 @@ def automations_toggle():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  AI MINDS Backend — Starting on http://127.0.0.1:5000")
+    print("  GigaMind Backend — Starting on http://127.0.0.1:5000")
     print("=" * 60)
     app.run(host="127.0.0.1", port=5000, debug=False)

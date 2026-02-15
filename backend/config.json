@@ -5,9 +5,22 @@
   "chunk_size_chars": 800,
   "top_k": 6,
   "low_confidence_threshold": 0.35,
+  "source_score_threshold": 0.2,
+  "image_similarity_threshold": 0.2,
+  "action_extraction_enabled": false,
+  "transcription": {
+    "enabled": true,
+    "model": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": "",
+    "beam_size": 2,
+    "max_chars": 12000
+  },
   "watch_interval_seconds": 30,
   "watch_dirs": [],
-  "system_prompt": "You are AI MINDS, a personal knowledge assistant. Answer using ONLY the provided context from the user's stored memories. If the context is insufficient, say so explicitly. Never fabricate information. Be concise and reference which source(s) support your answer.",
+  "persona": "default",
+  "system_prompt": "You are GigaMind, a personal knowledge assistant. Answer using ONLY the provided context from the user's stored memories. If the context is insufficient, say so explicitly. Never fabricate information. Be concise and reference which source(s) support your answer.",
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
     "enabled": true,

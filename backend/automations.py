@@ -1,5 +1,5 @@
 """
-AI MINDS — Automation module.
+GigaMind — Automation module.
 
 Background services that run autonomously:
   - Clipboard monitor: auto-ingest any copied text (>20 chars)

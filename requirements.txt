@@ -1,4 +1,4 @@
-# AI MINDS Backend Dependencies
+# GigaMind Backend Dependencies
 flask>=3.0
 flask-cors>=4.0
 requests>=2.31
@@ -12,3 +12,4 @@ pdfminer.six>=20221105
 python-docx>=1.1
 pyperclip>=1.8
 streamlit>=1.35
+faster-whisper>=1.1.0

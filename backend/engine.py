@@ -1,5 +1,5 @@
 """
-AI MINDS Engine — Core intelligence layer.
+GigaMind Engine — Core intelligence layer.
 
 Combines the best of second-brain (hybrid search, embeddings, BM25, MMR)
 and ai_minds_engine (categorization, summaries, actions, SQLite records)
@@ -29,8 +29,9 @@ from sentence_transformers import SentenceTransformer
 from PIL import Image
 
 from file_parsers import (
-    parse_txt, parse_pdf, parse_docx, parse_image,
+    parse_txt, parse_pdf, parse_docx, parse_media,
     SUPPORTED_TEXT_EXTENSIONS, SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_AUDIO_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -46,6 +47,12 @@ STOP_WORDS = set(
     "why how all any both each few more most other some such no nor not only "
     "own same so than too very s t can will just don should now".split()
 )
+
+ACTION_VERBS = {
+    "follow", "remind", "send", "call", "email", "review", "check", "prepare",
+    "schedule", "fix", "update", "submit", "complete", "create", "write", "plan",
+    "buy", "book", "draft", "organize", "finalize", "share", "finish",
+}
 
 
 def _now_iso() -> str:
@@ -113,20 +120,60 @@ def _sentence_summary(text: str, max_sentences: int = 2) -> str:
     return " ".join(sentences[:max_sentences]).strip() or text[:240]
 
 
+def _is_noisy_snippet(text: str) -> bool:
+    if _is_gibberish(text):
+        return True
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(cleaned) < 25:
+        return True
+    alpha_count = sum(1 for c in cleaned if c.isalpha())
+    return (alpha_count / max(1, len(cleaned))) < 0.35
+
+
 def _extract_actions(text: str) -> List[str]:
     patterns = [
-        r"\b(todo|to do|action item|follow up|remind me to|need to|should|must)\b",
-        r"\b(deadline|due|by\s+\w+day|next week|tomorrow|tonight)\b",
+        r"\b(todo|to do|action item|follow up|next step|remind me to|need to)\b",
+        r"\b(deadline|due|by\s+\w+day|next week|tomorrow|tonight|asap)\b",
+        r"\b(i|we|you)\s+(should|must|need to)\b",
     ]
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+
+    def _looks_like_noise(candidate: str) -> bool:
+        c = re.sub(r"\s+", " ", candidate).strip()
+        if len(c) < 10 or len(c) > 200:
+            return True
+        words = c.split()
+        if len(words) < 3 or len(words) > 24:
+            return True
+        lower = c.lower()
+        alpha_tokens = [w for w in re.findall(r"[a-zA-Z]+", c)]
+        if not alpha_tokens:
+            return True
+        digit_ratio = sum(ch.isdigit() for ch in c) / max(1, len(c))
+        if digit_ratio > 0.18:
+            return True
+        if lower.count("|") > 1 or lower.count("\t") > 1:
+            return True
+        has_action_verb = any(v in lower for v in ACTION_VERBS)
+        if not has_action_verb and any(ch in lower for ch in ["median", "price", "range", "value insight"]):
+            return True
+        return False
+
     hits = []
+    seen = set()
     for s in sentences:
         s = s.strip()
         if not s:
             continue
         if any(re.search(p, s, re.IGNORECASE) for p in patterns):
-            hits.append(s[:220])
-    return hits[:8]
+            if _looks_like_noise(s):
+                continue
+            snippet = re.sub(r"\s+", " ", s)[:200].strip(" -•\t")
+            key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", "", snippet.lower())).strip()
+            if key and key not in seen:
+                seen.add(key)
+                hits.append(snippet)
+    return hits[:5]
 
 
 def _categorize(text: str, metadata: Dict[str, Any]) -> str:
@@ -269,6 +316,26 @@ class AIMindsEngine:
                     created_at TEXT NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    confidence REAL,
+                    references_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES chat_sessions(id)
+                )
+            """)
             conn.commit()
 
     def _store_record(self, record_id: str, modality: str, category: str,
@@ -317,7 +384,8 @@ class AIMindsEngine:
 
         category = _categorize(text, metadata)
         summary = _sentence_summary(text)
-        actions = _extract_actions(text)
+        actions_enabled = bool(self.config.get("action_extraction_enabled", False))
+        actions = _extract_actions(text) if actions_enabled else []
 
         # Store raw chunks (no prefix in documents — prefix hurts semantic matching)
         prefixed = chunks
@@ -336,8 +404,16 @@ class AIMindsEngine:
             self.text_collection.upsert(
                 ids=ids, documents=prefixed, embeddings=embeddings, metadatas=metadatas
             )
-            for cid in ids:
-                self._store_record(cid, modality, category, summary, source, metadata, actions)
+            for idx, cid in enumerate(ids):
+                self._store_record(
+                    cid,
+                    modality,
+                    category,
+                    summary,
+                    source,
+                    metadata,
+                    actions if idx == 0 else [],
+                )
             self._bm25_rebuild()
 
         return {
@@ -355,7 +431,7 @@ class AIMindsEngine:
         )
 
     def ingest_file(self, file_path: str) -> Dict[str, Any]:
-        """Ingest a local file (text, PDF, DOCX, or image)."""
+        """Ingest a local file (text, image, audio, or video)."""
         path = Path(file_path)
         if not path.exists() or not path.is_file():
             return {"status": "error", "reason": "file_not_found"}
@@ -381,6 +457,22 @@ class AIMindsEngine:
         # Images
         if ext in SUPPORTED_IMAGE_EXTENSIONS:
             return self._ingest_image(path)
+
+        # Audio / Video (metadata-level ingestion)
+        if ext in (SUPPORTED_AUDIO_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS):
+            media_text = parse_media(path, self.config.get("transcription", {}))
+            media_kind = "audio" if ext in SUPPORTED_AUDIO_EXTENSIONS else "video"
+            return self.ingest_text(
+                text=media_text,
+                source=str(path),
+                modality=f"file_{media_kind}",
+                metadata={
+                    "source_path": str(path),
+                    "extension": ext,
+                    "source_type": "file",
+                    "media_type": media_kind,
+                },
+            )
 
         return {"status": "skipped", "reason": "unsupported_extension", "path": file_path}
 
@@ -576,8 +668,11 @@ class AIMindsEngine:
         if llm_note:
             uncertainty = f"{uncertainty} {llm_note}".strip() if uncertainty else llm_note
 
+        source_threshold = float(self.config.get("source_score_threshold", 0.2))
         references = []
         for item in results:
+            if float(item.get("score", 0)) < source_threshold:
+                continue
             references.append({
                 "source": item.get("metadata", {}).get("source", "unknown"),
                 "source_type": item.get("metadata", {}).get("source_type", "unknown"),
@@ -631,7 +726,14 @@ class AIMindsEngine:
                 return "Action items found:\n" + "\n".join(action_lines[:8])
             return "Related items found, but no explicit action items detected."
 
-        snippets = [f"- {r.get('documents', '')[:200].strip()}" for r in results[:4]]
+        clean_results = [r for r in results if not _is_noisy_snippet(r.get("documents", ""))]
+        if not clean_results:
+            return (
+                "I found potential matches, but the extracted text is too noisy to answer reliably. "
+                "Try a more specific question or ingest cleaner source files."
+            )
+
+        snippets = [f"- {r.get('documents', '')[:200].strip()}" for r in clean_results[:4]]
         return (
             f"Most relevant results for '{query}':\n" + "\n".join(snippets)
         )
@@ -654,7 +756,7 @@ class AIMindsEngine:
         context = "\n\n".join(context_parts)
 
         system_prompt = (
-            "You are AI MINDS, a personal knowledge assistant. "
+            "You are GigaMind, a personal knowledge assistant. "
             "Answer the user's question using the provided context from their stored memories. "
             "The context snippets come from different sources (web pages, notes, files). "
             "Be helpful: if context is available, synthesize a clear answer. "
@@ -719,7 +821,7 @@ class AIMindsEngine:
         context = "\n\n".join(context_parts)
 
         system_prompt = self.config.get("system_prompt", (
-            "You are AI MINDS, a personal knowledge assistant. "
+            "You are GigaMind, a personal knowledge assistant. "
             "Answer using ONLY the provided context. Never fabricate. "
             "Be concise, reference sources."
         ))
@@ -855,16 +957,305 @@ class AIMindsEngine:
                 "WHERE a.done = ? ORDER BY a.created_at DESC",
                 (1 if done else 0,),
             ).fetchall()
-        return [
-            {"id": r[0], "text": r[1], "done": bool(r[2]),
-             "created_at": r[3], "source": r[4]}
-            for r in rows
-        ]
+        grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for r in rows:
+            action_id, text, done_value, created_at, source = r
+            norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", "", (text or "").lower())).strip()
+            norm = norm[:120]
+            key = (norm, source or "")
+            if key not in grouped:
+                grouped[key] = {
+                    "id": action_id,
+                    "text": text,
+                    "done": bool(done_value),
+                    "created_at": created_at,
+                    "source": source,
+                    "duplicate_count": 1,
+                }
+            else:
+                grouped[key]["duplicate_count"] += 1
+
+        return sorted(grouped.values(), key=lambda x: x.get("created_at", ""), reverse=True)
 
     def mark_action_done(self, action_id: str):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("UPDATE actions SET done = 1 WHERE id = ?", (action_id,))
+            row = conn.execute(
+                "SELECT a.action_text, r.source FROM actions a "
+                "JOIN records r ON a.record_id = r.id WHERE a.id = ?",
+                (action_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            action_text, source = row
+            cur = conn.execute(
+                "UPDATE actions SET done = 1 WHERE done = 0 AND id IN ("
+                "SELECT a2.id FROM actions a2 JOIN records r2 ON a2.record_id = r2.id "
+                "WHERE a2.action_text = ? AND COALESCE(r2.source, '') = COALESCE(?, '')"
+                ")",
+                (action_text, source),
+            )
             conn.commit()
+            return int(cur.rowcount or 0)
+
+    def cleanup_actions(self) -> Dict[str, Any]:
+        """Remove noisy actions and collapse exact duplicates in DB."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT a.id, a.action_text, a.done, r.source FROM actions a "
+                "JOIN records r ON a.record_id = r.id"
+            ).fetchall()
+
+            removed_noisy = 0
+            seen = set()
+            removed_duplicates = 0
+
+            for action_id, action_text, done_value, source in rows:
+                normalized = re.sub(r"\s+", " ", (action_text or "")).strip()
+                key_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", "", normalized.lower())).strip()[:120]
+                if len(key_norm) < 8:
+                    conn.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+                    removed_noisy += 1
+                    continue
+
+                if any(term in key_norm for term in ["median price", "price range", "value insight", "property types"]):
+                    conn.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+                    removed_noisy += 1
+                    continue
+
+                dedup_key = (key_norm, source or "", int(done_value or 0))
+                if dedup_key in seen:
+                    conn.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+                    removed_duplicates += 1
+                    continue
+                seen.add(dedup_key)
+
+            conn.commit()
+
+        return {
+            "status": "ok",
+            "removed_noisy": removed_noisy,
+            "removed_duplicates": removed_duplicates,
+            "remaining": len(self.get_actions(done=False)) + len(self.get_actions(done=True)),
+        }
+
+    def purge_actions(self) -> Dict[str, Any]:
+        """Delete all action items (pending + done)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("DELETE FROM actions")
+            conn.commit()
+            deleted = int(cur.rowcount or 0)
+        return {"status": "ok", "deleted": deleted}
+
+    # ── Image Query ────────────────────────────────────────────────────────
+
+    def find_similar_images(self, image_path: str, top_k: int = 6) -> Dict[str, Any]:
+        """Search for similar ingested images using image embeddings."""
+        path = Path(image_path)
+        if not path.exists() or not path.is_file():
+            return {"status": "error", "reason": "file_not_found"}
+        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            return {"status": "error", "reason": "not_an_image"}
+
+        if self.image_collection.count() == 0:
+            return {
+                "status": "ok",
+                "answer": "No indexed images yet. Ingest images first, then try again.",
+                "references": [],
+            }
+
+        if self.image_model is None:
+            return {
+                "status": "error",
+                "reason": "image_model_unavailable",
+                "message": "Image model is not available. Configure a CLIP model to enable similar image search.",
+            }
+
+        try:
+            img = Image.open(path).convert("RGB")
+            img.thumbnail((2048, 2048))
+            emb = self.image_model.encode([img], normalize_embeddings=True).tolist()
+        except Exception as e:
+            return {"status": "error", "reason": f"image_read_failed: {e}"}
+
+        n_results = min(max(1, int(top_k)), self.image_collection.count())
+        result = self.image_collection.query(
+            query_embeddings=emb,
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        score_threshold = float(self.config.get("image_similarity_threshold", 0.2))
+        references: List[Dict[str, Any]] = []
+
+        ids = result.get("ids", [[]])[0]
+        docs = result.get("documents", [[]])[0]
+        metas = result.get("metadatas", [[]])[0]
+        dists = result.get("distances", [[]])[0]
+        query_resolved = str(path.resolve())
+
+        for i, image_id in enumerate(ids):
+            score = max(0.0, float(1 - dists[i]))
+            if score < score_threshold:
+                continue
+            meta = metas[i] or {}
+            source_candidate = meta.get("source_path") or meta.get("source") or ""
+            try:
+                if source_candidate and str(Path(source_candidate).resolve()) == query_resolved:
+                    continue
+            except Exception:
+                pass
+            references.append({
+                "id": image_id,
+                "source": meta.get("source", meta.get("source_path", "unknown")),
+                "source_type": meta.get("source_type", "file"),
+                "category": meta.get("category", "general"),
+                "modality": "image",
+                "snippet": (docs[i] or "")[:240],
+                "score": round(score, 4),
+            })
+
+        if not references:
+            return {
+                "status": "ok",
+                "answer": "No similar images found in memory above the similarity threshold.",
+                "references": [],
+            }
+
+        lines = [f"- {ref['source']} (score: {ref['score']:.2f})" for ref in references[:8]]
+        return {
+            "status": "ok",
+            "answer": "Closest visual matches from memory:\n" + "\n".join(lines),
+            "references": references,
+            "confidence": references[0].get("score", 0),
+        }
+
+    # ── Chat Sessions (Persistent) ────────────────────────────────────────
+
+    def create_chat_session(self, title: Optional[str] = None) -> Dict[str, Any]:
+        session_id = str(uuid.uuid4())
+        now = _now_iso()
+        safe_title = (title or "New Chat").strip() or "New Chat"
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO chat_sessions (id, title, created_at, updated_at) VALUES (?,?,?,?)",
+                (session_id, safe_title[:120], now, now),
+            )
+            conn.commit()
+        return {"id": session_id, "title": safe_title[:120], "created_at": now, "updated_at": now}
+
+    def list_chat_sessions(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "title": r[1],
+                "created_at": r[2],
+                "updated_at": r[3],
+                "message_count": int(r[4] or 0),
+            }
+            for r in rows
+        ]
+
+    def ensure_chat_session(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        if session_id:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT id, title, created_at, updated_at FROM chat_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row:
+                return {"id": row[0], "title": row[1], "created_at": row[2], "updated_at": row[3]}
+        sessions = self.list_chat_sessions()
+        if sessions:
+            return sessions[0]
+        return self.create_chat_session("New Chat")
+
+    def get_chat_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, role, content, confidence, references_json, created_at
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            refs = []
+            if r[4]:
+                try:
+                    refs = json.loads(r[4])
+                except Exception:
+                    refs = []
+            out.append({
+                "id": r[0],
+                "role": r[1],
+                "content": r[2],
+                "confidence": r[3],
+                "references": refs,
+                "created_at": r[5],
+            })
+        return out
+
+    def save_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        confidence: Optional[float] = None,
+        references: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        session = self.ensure_chat_session(session_id)
+        message_id = str(uuid.uuid4())
+        now = _now_iso()
+        refs_json = json.dumps(references or [])
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO chat_messages (id, session_id, role, content, confidence, references_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                (message_id, session["id"], role, content, confidence, refs_json, now),
+            )
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                (now, session["id"]),
+            )
+            conn.commit()
+        return {
+            "id": message_id,
+            "session_id": session["id"],
+            "role": role,
+            "content": content,
+            "confidence": confidence,
+            "references": references or [],
+            "created_at": now,
+        }
+
+    def delete_chat_session(self, session_id: str) -> Dict[str, Any]:
+        """Delete a chat session and all of its messages."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT id FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                return {"status": "error", "reason": "session_not_found"}
+
+            conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+            conn.commit()
+
+        return {"status": "ok", "deleted_session_id": session_id}
 
     # ── Automation Helpers ─────────────────────────────────────────────────
 

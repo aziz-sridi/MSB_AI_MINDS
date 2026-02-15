@@ -1,11 +1,11 @@
-# 🧠 AI MINDS — Intelligent Personal Knowledge System
+# GigaMind — Intelligent Personal Knowledge System
 
-> An AI-powered cognitive assistant that converts raw personal data into structured, searchable memory with natural language interaction. Built for the AI MINDS hackathon.
+> An AI-powered cognitive assistant that converts raw personal data into structured, searchable memory with natural language interaction. Built for the GigaMind hackathon project.
 
 ## What It Does
 
-1. **Automatically ingests** personal data from multiple sources — files (PDF, DOCX, TXT, images), web pages (via browser extension), clipboard, and watched directories
-2. **Understands content** using local embedding models (sentence-transformers + CLIP) — no cloud APIs needed
+1. **Automatically ingests** personal data from multiple sources — files (PDF, DOCX, TXT, images, audio, video), web pages (via browser extension), clipboard, and watched directories
+2. **Understands content** using local embedding models (sentence-transformers + CLIP) and local Whisper transcription for media — no cloud APIs needed
 3. **Organizes information** into meaningful categories (work, learning, finance, health, personal, code, news)
 4. **Extracts action items** and produces concise summaries
 5. **Answers questions** with grounded, referenced answers using Ollama LLM (≤4B params)
@@ -33,7 +33,7 @@
 │  • /stats, /actions, /digest                             │
 │  • /config — runtime configuration                       │
 ├──────────────────────────────────────────────────────────┤
-│                    AI MINDS Engine                        │
+│                    GigaMind Engine                        │
 │  • Hybrid search: semantic (cosine) + lexical (BM25)     │
 │  • MMR reranking for diversity                           │
 │  • ChromaDB vector store + SQLite metadata               │
@@ -74,6 +74,7 @@
 - **Python 3.10+**
 - **Ollama** — [install from ollama.com](https://ollama.com)
 - **Chrome/Edge** browser (for extension)
+- **FFmpeg** in PATH (required by `faster-whisper` for many audio/video formats)
 
 ### 1. Install Dependencies
 
@@ -111,7 +112,7 @@ Opens at `http://127.0.0.1:8501`.
 1. Open Chrome → `chrome://extensions/`
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked** → select the `ai-minds/extension/` folder
-4. The 🧠 AI MINDS icon appears in your toolbar
+4. The GigaMind icon appears in your toolbar
 
 ### Or Use the Start Script (Windows)
 
@@ -134,7 +135,8 @@ This launches both backend and frontend automatically.
 - **Chat** — Ask natural language questions. Get grounded answers with confidence scores and source references.
 - **Dashboard** — View stats, categories, recent records, and generate digests.
 - **Actions** — View and manage action items extracted from your data.
-- **Ingest** — Manually paste text, specify file paths, or trigger directory scans.
+- **Ingest** — Manually paste text, upload/specify file paths, or trigger directory scans.
+- **Media note** — Audio/video ingestion now includes local Whisper transcription (configurable in Settings). If transcription fails, metadata-only fallback is used.
 - **Settings** — Configure Ollama model, embedding models, watch directories, chunk size, system prompt, etc.
 
 ### API Endpoints
@@ -191,7 +193,7 @@ ai-minds/
 
 | Requirement | Implementation |
 |-------------|---------------|
-| Multimodal ingestion | Text (PDF, DOCX, TXT), images (CLIP), web pages (extension) |
+| Multimodal ingestion | Text (PDF, DOCX, TXT), images (CLIP), web pages (extension), audio/video with local Whisper transcription + metadata |
 | No manual uploads | Directory watcher, browser auto-capture, clipboard monitor |
 | Meaningful categories | Rule-based + LLM-assisted categorization |
 | Summaries & actions | Auto-extracted on ingestion |
@@ -207,3 +209,10 @@ ai-minds/
 ## License
 
 MIT
+
+## Current Audio/Video Status
+
+- Voice messages and videos are accepted by `/ingest/file` and watch-folder ingestion.
+- Current behavior: local Whisper transcription via `faster-whisper` is attempted during ingestion.
+- If transcription fails (e.g., missing FFmpeg, unsupported codec, or model/runtime issue), ingestion still proceeds with metadata fallback.
+- Configure transcription in **Settings → Media Transcription (Whisper)**.
