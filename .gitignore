@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# Virtual environments
+rag_env/
+venv/
+.env
+*.env
+
+# Data and database files
+data/
+backend/data/
+*.sqlite3
+*.db
+
+# Logs
+*.log
+
+# Node.js dependencies and build outputs
+node_modules/
+dist/
+build/
+.next/
+.cache/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# VS Code and JetBrains IDE settings (optional)
+.vscode/
+.idea/
