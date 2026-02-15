@@ -12,16 +12,18 @@
   "time_decay_weight": 0.15,
   "action_extraction_enabled": false,
   "transcription": {
-    "enabled": true,
-    "model": "small",
-    "device": "cpu",
-    "compute_type": "int8",
-    "language": "",
     "beam_size": 2,
-    "max_chars": 12000
+    "compute_type": "int8",
+    "device": "cpu",
+    "enabled": true,
+    "language": "",
+    "max_chars": 12000,
+    "model": "small"
   },
   "watch_interval_seconds": 30,
-  "watch_dirs": [],
+  "watch_dirs": [
+    "C:\\Users\\azizs\\Downloads\\Maids"
+  ],
   "persona": "default",
   "system_prompt": "You are GigaMind, a personal knowledge assistant. Answer using ONLY the provided context from the user's stored memories. If the context is insufficient, say so explicitly. Never fabricate information. Be concise and reference which source(s) support your answer.",
   "ollama": {
@@ -31,7 +33,7 @@
     "timeout_seconds": 30
   },
   "automations": {
-    "browser_history": false,
+    "browser_history": true,
     "browser_history_interval": 120,
     "clipboard_monitor": true,
     "digest_interval_hours": 24,

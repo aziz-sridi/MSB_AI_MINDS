@@ -561,8 +561,15 @@ class AIMindsEngine:
         if not path.exists() or not path.is_file():
             return {"status": "error", "reason": "file_not_found"}
 
+        # Skip files still being downloaded
+        if path.suffix.lower() in {".crdownload", ".partial", ".tmp", ".download"}:
+            return {"status": "skipped", "reason": "download_in_progress"}
+
         ext = path.suffix.lower()
         file_ts = self._get_file_timestamps(path)
+
+        # Build a filename header so the file is discoverable by name
+        filename_header = f"File: {path.name}\nPath: {path.parent}\n\n"
 
         # Text-based files
         if ext in SUPPORTED_TEXT_EXTENSIONS:
@@ -575,9 +582,11 @@ class AIMindsEngine:
             text = parser(path)
             if not text:
                 return {"status": "skipped", "reason": "empty_content"}
+            # Prepend filename so users can search by file name
+            text = filename_header + text
             return self.ingest_text(
                 text=text, source=str(path), modality=f"file_{ext.strip('.')}",
-                metadata={"source_path": str(path), "extension": ext, "source_type": "file", **file_ts},
+                metadata={"source_path": str(path), "filename": path.name, "extension": ext, "source_type": "file", **file_ts},
             )
 
         # Images
@@ -589,11 +598,12 @@ class AIMindsEngine:
             media_text = parse_media(path, self.config.get("transcription", {}))
             media_kind = "audio" if ext in SUPPORTED_AUDIO_EXTENSIONS else "video"
             return self.ingest_text(
-                text=media_text,
+                text=filename_header + media_text,
                 source=str(path),
                 modality=f"file_{media_kind}",
                 metadata={
                     "source_path": str(path),
+                    "filename": path.name,
                     "extension": ext,
                     "source_type": "file",
                     "media_type": media_kind,
@@ -606,9 +616,10 @@ class AIMindsEngine:
     def _ingest_image(self, path: Path) -> Dict[str, Any]:
         filename = path.name
         folder = path.parent.name
-        surrogate = f"image {filename} in folder {folder}"
+        surrogate = f"File: {filename}\nImage file: {filename} located in folder {folder}"
         meta = {
-            "source_path": str(path), "extension": path.suffix.lower(),
+            "source_path": str(path), "filename": filename,
+            "extension": path.suffix.lower(),
             "modality": "image", "source": str(path), "source_type": "file",
             "category": _categorize_rules(surrogate, {"source_path": str(path)}),
             "summary": f"Image file: {filename}",
@@ -707,6 +718,65 @@ class AIMindsEngine:
                 break
         return results
 
+    def _filename_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """Search for chunks that belong to a file whose name appears in the query.
+        Instead of regex-parsing filenames from the query, checks each ingested
+        file's name against the query text — more reliable with special chars."""
+        query_lower = query.lower()
+        results = []
+
+        try:
+            # Get all records (no where filter — some old records lack source_type)
+            all_records = self.text_collection.get(
+                include=["documents", "metadatas", "embeddings"],
+            )
+            ids = all_records.get("ids", [])
+            docs = all_records.get("documents", [])
+            metas = all_records.get("metadatas", [])
+            embs = all_records.get("embeddings", [])
+
+            for i, doc_id in enumerate(ids):
+                meta = metas[i] or {}
+                # Only look at file-sourced records
+                if meta.get("source_type") != "file":
+                    continue
+                fname = meta.get("filename", "")
+                if not fname:
+                    # Fallback: extract filename from source_path
+                    sp = meta.get("source_path", "")
+                    if sp:
+                        fname = Path(sp).name
+                if not fname:
+                    continue
+                # Check if this file's name appears in the query
+                if fname.lower() in query_lower:
+                    results.append({
+                        "id": doc_id,
+                        "documents": docs[i],
+                        "metadata": meta,
+                        "embedding": np.array(embs[i]),
+                        "score": 1.0,
+                        "raw_score": 0.95,
+                        "result_type": "filename_match",
+                    })
+                else:
+                    # Also try matching without extension
+                    stem = Path(fname).stem.lower()
+                    if len(stem) > 3 and stem in query_lower:
+                        results.append({
+                            "id": doc_id,
+                            "documents": docs[i],
+                            "metadata": meta,
+                            "embedding": np.array(embs[i]),
+                            "score": 0.9,
+                            "raw_score": 0.85,
+                            "result_type": "filename_match",
+                        })
+        except Exception as e:
+            print(f"[engine] Filename search error: {e}")
+
+        return results[:top_k]
+
     def _hybrid_search(self, query: str, top_k: int = 6, category: Optional[str] = None,
                        date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict]:
         """Combine semantic + lexical search with MMR reranking.
@@ -716,6 +786,7 @@ class AIMindsEngine:
 
         sem_results = self._semantic_search(query, fetch_k, category=category)
         lex_results = self._lexical_search(query, fetch_k, category=category)
+        file_results = self._filename_search(query, top_k=fetch_k)
 
         # Keep raw semantic scores for confidence (before normalization)
         # Normalize semantic scores for ranking
@@ -760,6 +831,16 @@ class AIMindsEngine:
                     }
                 except Exception:
                     continue
+
+        # Merge filename matches with high priority
+        for r in file_results:
+            if r["id"] in combined:
+                # Boost existing result if it also matches by filename
+                combined[r["id"]]["score"] = max(combined[r["id"]]["score"], 0.95)
+                combined[r["id"]]["raw_score"] = max(combined[r["id"]].get("raw_score", 0), 0.95)
+                combined[r["id"]]["result_type"] = "filename_match"
+            else:
+                combined[r["id"]] = r.copy()
 
         # ── Date-period filtering ──
         if date_from or date_to:
@@ -1253,7 +1334,11 @@ class AIMindsEngine:
     # ── Directory Watching ─────────────────────────────────────────────────
 
     def ingest_watch_dirs(self) -> Dict[str, Any]:
-        """Scan all watched directories for new/modified files."""
+        """Scan all watched directories for new/modified files.
+        Uses non-recursive scan and filters by supported extensions.
+        Saves state incrementally so progress isn't lost on crash."""
+        from file_parsers import ALL_SUPPORTED
+
         watch_dirs = [Path(p) for p in self.config.get("watch_dirs", []) if p]
         if not watch_dirs:
             return {"status": "skipped", "reason": "no_watch_dirs"}
@@ -1265,29 +1350,50 @@ class AIMindsEngine:
             except Exception:
                 previous_state = {}
 
-        current_state: Dict[str, float] = {}
+        current_state: Dict[str, float] = dict(previous_state)  # preserve known files
         processed = 0
         errors = 0
 
         for directory in watch_dirs:
             if not directory.exists() or not directory.is_dir():
                 continue
-            for path in directory.rglob("*"):
+            # Use iterdir (non-recursive) — faster and avoids scanning extracted archives
+            for path in directory.iterdir():
                 if not path.is_file():
                     continue
-                as_str = str(path)
-                mtime = path.stat().st_mtime
-                current_state[as_str] = mtime
-                if previous_state.get(as_str) == mtime:
+                ext = path.suffix.lower()
+                # Skip unsupported extensions and temp download files early
+                if ext in {".crdownload", ".partial", ".tmp", ".download"}:
+                    continue
+                if ext not in ALL_SUPPORTED:
                     continue
                 try:
+                    as_str = str(path)
+                    mtime = path.stat().st_mtime
+                    current_state[as_str] = mtime
+                    if previous_state.get(as_str) == mtime:
+                        continue
+                    # Ensure file is fully written (size stable)
+                    size1 = path.stat().st_size
+                    if size1 == 0:
+                        continue
+                    time.sleep(0.3)
+                    size2 = path.stat().st_size
+                    if size1 != size2:
+                        # File still being written, skip for now
+                        current_state.pop(as_str, None)
+                        continue
                     result = self.ingest_file(as_str)
                     if result.get("status") == "ok":
                         processed += 1
+                        print(f"[watcher] Ingested: {path.name} ({result.get('chunks_added', 0)} chunks)")
+                    # Save state after each file so progress isn't lost
+                    self.file_state_path.write_text(json.dumps(current_state), encoding="utf-8")
                 except Exception as e:
-                    print(f"[engine] Error ingesting {as_str}: {e}")
+                    print(f"[engine] Error ingesting {path.name}: {e}")
                     errors += 1
 
+        # Final state save
         self.file_state_path.write_text(json.dumps(current_state), encoding="utf-8")
         return {"status": "ok", "processed": processed, "errors": errors}
 
