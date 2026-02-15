@@ -109,11 +109,12 @@ def resolve_mascot_path() -> Path | None:
 
 
 def is_image_description_prompt(prompt: str) -> bool:
-    """Detect prompts that mainly ask to describe/analyze an image."""
+    """Detect prompts that mainly ask to describe/analyze an image (legacy, kept for compat)."""
     normalized = re.sub(r"[^a-z0-9\s]", " ", (prompt or "").lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    describe_words = ["describe", "what is in", "what s in", "analyze", "explain image", "caption"]
-    image_words = ["image", "img", "picture", "photo", "pic", "qge"]
+    describe_words = ["describe", "what is in", "what s in", "analyze", "explain image", "caption",
+                      "identify", "recognize", "what does", "tell me about"]
+    image_words = ["image", "img", "picture", "photo", "pic", "screenshot", "uploaded"]
     has_describe = any(word in normalized for word in describe_words)
     has_image_word = any(word in normalized for word in image_words)
     return has_describe and has_image_word
@@ -236,10 +237,17 @@ if page == "Chat":
                             if refs:
                                 with st.expander("Sources", expanded=False):
                                     for ref in refs:
+                                        ingested = ref.get('ingested_at', '')
+                                        file_mod = ref.get('file_modified_at', '')
+                                        date_info = ''
+                                        if ingested:
+                                            date_info += f", ingested: {ingested[:10]}"
+                                        if file_mod:
+                                            date_info += f", modified: {file_mod[:10]}"
                                         st.caption(
                                             f"**{ref.get('source', 'unknown')}** "
                                             f"(score: {ref.get('score', 0):.2f}, "
-                                            f"category: {ref.get('category', '')})"
+                                            f"category: {ref.get('category', '')}{date_info})"
                                         )
 
                 uploaded_query_image = st.file_uploader(
@@ -258,14 +266,14 @@ if page == "Chat":
                     help="Keep this off for pure query images. Turn on if you want this image indexed permanently.",
                 )
 
-                if prompt := st.chat_input("Ask anything about your stored memories..."):
+                if prompt := st.chat_input("Ask anything — dates, categories, image intent are auto-detected..."):
                     image_path = None
                     if uploaded_query_image is not None:
                         image_path = save_uploaded_file(uploaded_query_image, "chat_queries")
 
                     user_content = prompt
                     if image_path and uploaded_query_image is not None:
-                        user_content = f"{prompt}\n\n[Image prompt: {uploaded_query_image.name}]"
+                        user_content = f"{user_content}\n\n[Image: {uploaded_query_image.name}]"
 
                     api(
                         "post",
@@ -273,54 +281,54 @@ if page == "Chat":
                         json={"role": "user", "content": user_content},
                     )
 
-                    with st.spinner("Searching memory & thinking..."):
-                        image_only_prompt = bool(image_path) and is_image_description_prompt(prompt)
-                        text_result = None
-                        if not image_only_prompt:
-                            text_result = api("post", "/query", json={"question": prompt})
-
-                        image_result = None
-
+                    with st.spinner("Understanding your query & searching memory..."):
+                        # Use smart query — LLM extracts date, category, image intent automatically
+                        smart_payload = {
+                            "question": prompt,
+                            "persist_image": persist_image,
+                        }
                         if image_path:
-                            image_result = api("post", "/query/image", json={"image_path": image_path, "top_k": 6})
-                            if persist_image:
-                                api("post", "/ingest/file", json={"path": image_path})
+                            smart_payload["image_path"] = image_path
 
-                    answer_parts = []
-                    refs = []
-                    confidence = 0.0
-                    uncertainty = None
+                        result = api("post", "/query/smart", json=smart_payload)
 
-                    if isinstance(text_result, dict) and "error" not in text_result:
-                        answer_parts.append(text_result.get("answer", ""))
-                        refs.extend(text_result.get("references", []) or [])
-                        confidence = max(confidence, float(text_result.get("confidence", 0) or 0))
-                        uncertainty = text_result.get("uncertainty")
-                    elif isinstance(text_result, dict) and text_result.get("error"):
-                        answer_parts.append(f"Text query error: {text_result.get('error')}")
+                    if isinstance(result, dict) and "error" not in result:
+                        final_answer = result.get("answer", "No answer found.")
+                        confidence = float(result.get("confidence", 0) or 0)
+                        refs = result.get("references", []) or []
+                        uncertainty = result.get("uncertainty")
 
-                    if isinstance(image_result, dict) and image_result.get("status") == "ok":
-                        answer_parts.append(image_result.get("answer", ""))
-                        refs.extend(image_result.get("references", []) or [])
-                        confidence = max(confidence, float(image_result.get("confidence", 0) or 0))
-                    elif isinstance(image_result, dict) and image_result.get("status") == "error":
-                        answer_parts.append(f"Image query error: {image_result.get('reason', 'failed')}")
+                        # Show what the LLM detected
+                        extracted = result.get("extracted_params", {})
+                        detected_parts = []
+                        if extracted.get("category"):
+                            detected_parts.append(f"category: **{extracted['category']}**")
+                        if extracted.get("date_from"):
+                            detected_parts.append(f"from: {extracted['date_from'][:10]}")
+                        if extracted.get("date_to"):
+                            detected_parts.append(f"to: {extracted['date_to'][:10]}")
+                        if extracted.get("image_intent"):
+                            detected_parts.append(f"image: **{extracted['image_intent']}**")
+                        if detected_parts:
+                            st.caption(f"Detected: {' | '.join(detected_parts)}")
 
-                    final_answer = "\n\n".join([p for p in answer_parts if p]).strip() or "No answer found."
+                        api(
+                            "post",
+                            f"/chat/sessions/{selected_chat_id}/messages",
+                            json={
+                                "role": "assistant",
+                                "content": final_answer,
+                                "confidence": confidence,
+                                "references": refs,
+                            },
+                        )
 
-                    api(
-                        "post",
-                        f"/chat/sessions/{selected_chat_id}/messages",
-                        json={
-                            "role": "assistant",
-                            "content": final_answer,
-                            "confidence": confidence,
-                            "references": refs,
-                        },
-                    )
+                        if uncertainty:
+                            st.caption(f"Warning: {uncertainty}")
+                    else:
+                        err = result.get("error", "Unknown error") if isinstance(result, dict) else str(result)
+                        st.error(f"Query failed: {err}")
 
-                    if uncertainty:
-                        st.caption(f"Warning: {uncertainty}")
                     st.rerun()
 
 
@@ -774,6 +782,24 @@ elif page == "Settings":
             watch_interval = st.slider("Watch interval (seconds)", 10, 300,
                                        int(config.get("watch_interval_seconds", 30)))
 
+            st.subheader("Time-Decay Relevance")
+            st.caption("Newer content gets a relevance boost. Older content gradually decays.")
+            time_decay_enabled = st.checkbox(
+                "Enable time-decay scoring",
+                value=bool(config.get("time_decay_enabled", True)),
+                help="When enabled, newer content scores higher in search results.",
+            )
+            time_decay_half_life = st.slider(
+                "Half-life (days)",
+                1, 365, int(config.get("time_decay_half_life_days", 30)),
+                help="Number of days until a record's time-decay weight drops to 50%. Lower = faster decay.",
+            )
+            time_decay_weight = st.slider(
+                "Decay blend weight",
+                0.0, 0.5, float(config.get("time_decay_weight", 0.15)), 0.01,
+                help="How much time-decay influences final ranking (0 = off, 0.5 = heavy).",
+            )
+
             st.subheader("Source & Similarity Thresholds")
             source_score_threshold = st.slider(
                 "Minimum source score to attach references",
@@ -866,6 +892,9 @@ elif page == "Settings":
                     "image_model_name": image_model,
                     "watch_dirs": dirs,
                     "watch_interval_seconds": watch_interval,
+                    "time_decay_enabled": time_decay_enabled,
+                    "time_decay_half_life_days": time_decay_half_life,
+                    "time_decay_weight": time_decay_weight,
                     "source_score_threshold": source_score_threshold,
                     "image_similarity_threshold": image_similarity_threshold,
                     "action_extraction_enabled": action_extraction_enabled,
@@ -900,3 +929,28 @@ elif page == "Settings":
 
             Install with: `ollama pull qwen2.5:3b`
             """)
+
+            st.divider()
+            st.subheader("Danger Zone")
+            st.caption("Irreversible actions that delete your data.")
+            st.error("Warning: This permanently deletes ALL stored knowledge, embeddings, records, actions, and chat history.")
+            purge_col1, purge_col2 = st.columns([3, 1])
+            with purge_col1:
+                purge_confirm = st.checkbox(
+                    "I understand this will delete everything",
+                    value=False,
+                    key="purge_confirm",
+                )
+            with purge_col2:
+                if st.button("Purge All Data", type="primary", disabled=not purge_confirm, use_container_width=True):
+                    with st.spinner("Wiping all data..."):
+                        result = api("post", "/purge/all", json={"confirm": True})
+                    if result.get("status") == "ok":
+                        st.success(
+                            f"All data purged. "
+                            f"Text chunks: {result.get('text_chunks_deleted', 0)}, "
+                            f"Images: {result.get('image_items_deleted', 0)}, "
+                            f"Records: {result.get('records_deleted', 0)}"
+                        )
+                    else:
+                        st.error(f"Purge failed: {result}")
