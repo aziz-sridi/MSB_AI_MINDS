@@ -7,6 +7,9 @@
   "low_confidence_threshold": 0.35,
   "source_score_threshold": 0.2,
   "image_similarity_threshold": 0.2,
+  "time_decay_enabled": true,
+  "time_decay_half_life_days": 30,
+  "time_decay_weight": 0.15,
   "action_extraction_enabled": false,
   "transcription": {
     "enabled": true,

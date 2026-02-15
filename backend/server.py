@@ -35,6 +35,21 @@ automations = AutomationManager(engine)
 automations.start_all()
 
 
+# ── Global error handler — always return JSON, never HTML ────────────────────
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Catch all unhandled exceptions and return JSON error."""
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
@@ -135,8 +150,39 @@ def query():
         return jsonify({"error": "question is required"}), 400
 
     top_k = payload.get("top_k")
-    result = engine.answer(question, top_k=top_k)
+    category = (payload.get("category") or "").strip() or None
+    date_from = (payload.get("date_from") or "").strip() or None
+    date_to = (payload.get("date_to") or "").strip() or None
+    result = engine.answer(question, top_k=top_k, category=category,
+                           date_from=date_from, date_to=date_to)
     return jsonify(result)
+
+
+@app.route("/query/smart", methods=["POST"])
+def query_smart():
+    """Smart query — LLM extracts date, category, image intent from natural language.
+    Accepts: question, image_path (optional), persist_image (optional bool).
+    The LLM parses 'what was I working on 3 months ago' into
+    category=work, date_from=3mo ago, date_to=today automatically."""
+    try:
+        payload = request.get_json(force=True)
+        question = (payload.get("question") or "").strip()
+        if not question:
+            return jsonify({"error": "question is required"}), 400
+
+        image_path = (payload.get("image_path") or "").strip() or None
+        persist_image = bool(payload.get("persist_image", False))
+
+        result = engine.smart_query(
+            query=question,
+            image_path=image_path,
+            persist_image=persist_image,
+        )
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Smart query failed: {str(e)}"}), 500
 
 
 @app.route("/query/image", methods=["POST"])
@@ -173,9 +219,13 @@ def chat_stream():
     question = (payload.get("question") or "").strip()
     if not question:
         return jsonify({"error": "question is required"}), 400
+    category = (payload.get("category") or "").strip() or None
+    date_from = (payload.get("date_from") or "").strip() or None
+    date_to = (payload.get("date_to") or "").strip() or None
 
     def generate():
-        for chunk in engine.ollama_stream(question):
+        for chunk in engine.ollama_stream(question, category=category,
+                                           date_from=date_from, date_to=date_to):
             yield f"data: {json.dumps({'token': chunk})}\n\n"
         yield "data: {\"done\": true}\n\n"
 
@@ -281,6 +331,21 @@ def cleanup_actions():
 def purge_actions():
     result = engine.purge_actions()
     return jsonify(result)
+
+
+@app.route("/purge/all", methods=["POST"])
+def purge_all():
+    """Delete ALL data: vector stores, SQLite records, BM25 cache, chat history.
+    This is a full factory reset of everything the system has learned."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        confirm = payload.get("confirm", False)
+        if not confirm:
+            return jsonify({"error": "Must send {\"confirm\": true} to purge all data."}), 400
+        result = engine.purge_all_data()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": f"Purge failed: {str(e)}"}), 500
 
 
 # ── Chat Sessions (Persistent) ─────────────────────────────────────────────

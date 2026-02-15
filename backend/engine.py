@@ -7,6 +7,7 @@ with Ollama-powered LLM (≤4B params) for grounded Q&A.
 """
 
 import json
+import math
 import os
 import pickle
 import re
@@ -57,6 +58,27 @@ ACTION_VERBS = {
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _epoch_now() -> float:
+    return time.time()
+
+
+def _parse_iso_to_epoch(iso_str: str) -> float:
+    """Parse an ISO timestamp string to epoch seconds."""
+    try:
+        return time.mktime(time.strptime(iso_str[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+
+def _time_decay_weight(created_epoch: float, half_life_days: float = 30.0) -> float:
+    """Exponential time-decay: score multiplier in (0, 1].
+    Half-life = number of days until the weight drops to 0.5."""
+    if created_epoch <= 0:
+        return 0.5
+    age_days = max(0, (time.time() - created_epoch)) / 86400.0
+    return math.pow(0.5, age_days / half_life_days)
 
 
 def _normalize_tokens(text: str) -> List[str]:
@@ -176,7 +198,11 @@ def _extract_actions(text: str) -> List[str]:
     return hits[:5]
 
 
-def _categorize(text: str, metadata: Dict[str, Any]) -> str:
+VALID_CATEGORIES = ["work", "learning", "finance", "health", "personal", "news", "code", "general"]
+
+
+def _categorize_rules(text: str, metadata: Dict[str, Any]) -> str:
+    """Fast rule-based fallback when Ollama is unavailable."""
     joined = f"{text} {metadata.get('url', '')} {metadata.get('source_path', '')}".lower()
     rules = {
         "work": ["meeting", "project", "jira", "deadline", "client", "sprint", "task"],
@@ -204,6 +230,21 @@ def _intent_from_query(query: str) -> str:
     if any(w in q for w in ["automat", "schedule", "remind", "alert", "notify"]):
         return "automation"
     return "qa"
+
+
+IMAGE_INTENTS = ["find_similar", "describe", "ingest", "text_query_with_image"]
+
+
+def _image_intent_fallback(prompt: str) -> str:
+    """Fast rule-based image intent when LLM is unavailable."""
+    p = prompt.lower()
+    if any(w in p for w in ["similar", "find", "match", "look like", "resembl", "same"]):
+        return "find_similar"
+    if any(w in p for w in ["describe", "what is", "what's in", "analyze", "explain", "caption", "identify", "recogni"]):
+        return "describe"
+    if any(w in p for w in ["save", "store", "ingest", "remember", "keep"]):
+        return "ingest"
+    return "find_similar"
 
 
 # ── Main Engine ──────────────────────────────────────────────────────────────
@@ -340,11 +381,12 @@ class AIMindsEngine:
 
     def _store_record(self, record_id: str, modality: str, category: str,
                       summary: str, source: str, metadata: Dict, actions: List[str]):
+        now = _now_iso()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?,?)",
                 (record_id, modality, category, summary, source,
-                 json.dumps(metadata), _now_iso()),
+                 json.dumps(metadata), now),
             )
             conn.execute("DELETE FROM actions WHERE record_id = ?", (record_id,))
             for action in actions:
@@ -371,6 +413,59 @@ class AIMindsEngine:
         else:
             self.bm25_index = None
 
+    # ── LLM Categorization ──────────────────────────────────────────────
+
+    def _categorize_llm(self, full_text: str, metadata: Dict[str, Any]) -> str:
+        """Use Ollama LLM to classify content into a category.
+
+        Sends the full source text (truncated) + metadata so the model
+        understands overall context rather than judging isolated chunks.
+        Falls back to rule-based classification on any failure.
+        """
+        llm_cfg = self.config.get("ollama", {})
+        if not llm_cfg.get("enabled", False):
+            return _categorize_rules(full_text, metadata)
+
+        base_url = llm_cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
+        model = llm_cfg.get("model", "qwen2.5:3b")
+
+        # Build a concise preview the LLM can judge (first ~1500 chars)
+        preview = re.sub(r"\s+", " ", full_text).strip()[:1500]
+        source_hint = metadata.get("url") or metadata.get("source_path") or metadata.get("source", "")
+        source_type = metadata.get("source_type", "unknown")
+
+        prompt = (
+            "Classify the following content into exactly ONE category.\n"
+            f"Valid categories: {', '.join(VALID_CATEGORIES)}\n\n"
+            f"Source: {source_hint}\n"
+            f"Source type: {source_type}\n\n"
+            f"Content preview:\n{preview}\n\n"
+            "Reply with ONLY the single category word, nothing else."
+        )
+
+        try:
+            import requests as _req
+            resp = _req.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"temperature": 0.0, "num_predict": 12},
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                raw = resp.json().get("message", {}).get("content", "").strip().lower()
+                # Extract first valid category word from the response
+                for token in re.split(r"[\s,.:;]+", raw):
+                    if token in VALID_CATEGORIES:
+                        return token
+        except Exception as e:
+            print(f"[engine] LLM categorization failed, using rules: {e}")
+
+        return _categorize_rules(full_text, metadata)
+
     # ── Ingestion ──────────────────────────────────────────────────────────
 
     def ingest_text(self, text: str, source: str, modality: str,
@@ -382,7 +477,8 @@ class AIMindsEngine:
         if not chunks:
             return {"status": "skipped", "reason": "empty_or_gibberish", "source": source}
 
-        category = _categorize(text, metadata)
+        # LLM-based categorization using full source text (not individual chunks)
+        category = self._categorize_llm(text, metadata)
         summary = _sentence_summary(text)
         actions_enabled = bool(self.config.get("action_extraction_enabled", False))
         actions = _extract_actions(text) if actions_enabled else []
@@ -394,10 +490,22 @@ class AIMindsEngine:
             prefixed, convert_to_numpy=True, normalize_embeddings=True, batch_size=16
         ).tolist()
 
+        now_iso = _now_iso()
+        now_epoch = _epoch_now()
+
+        # Extract file timestamps if available
+        file_created_at = metadata.get("file_created_at", now_iso)
+        file_modified_at = metadata.get("file_modified_at", now_iso)
+
         ids = [str(uuid.uuid4()) for _ in chunks]
         metadatas = [{
             "source": source, "modality": modality, "category": category,
-            "summary": summary, "chunk_index": i, **metadata,
+            "summary": summary, "chunk_index": i,
+            "ingested_at": now_iso,
+            "ingested_at_epoch": now_epoch,
+            "file_created_at": file_created_at,
+            "file_modified_at": file_modified_at,
+            **metadata,
         } for i in range(len(chunks))]
 
         with self.lock:
@@ -430,6 +538,23 @@ class AIMindsEngine:
             metadata={**metadata, "source_type": "web", "timestamp": time.time()},
         )
 
+    def _get_file_timestamps(self, path: Path) -> Dict[str, str]:
+        """Extract file creation and modification timestamps."""
+        try:
+            stat = path.stat()
+            created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_ctime))
+            modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime))
+            return {
+                "file_created_at": created,
+                "file_modified_at": modified,
+                "file_created_epoch": stat.st_ctime,
+                "file_modified_epoch": stat.st_mtime,
+            }
+        except Exception:
+            now = _now_iso()
+            return {"file_created_at": now, "file_modified_at": now,
+                    "file_created_epoch": _epoch_now(), "file_modified_epoch": _epoch_now()}
+
     def ingest_file(self, file_path: str) -> Dict[str, Any]:
         """Ingest a local file (text, image, audio, or video)."""
         path = Path(file_path)
@@ -437,6 +562,7 @@ class AIMindsEngine:
             return {"status": "error", "reason": "file_not_found"}
 
         ext = path.suffix.lower()
+        file_ts = self._get_file_timestamps(path)
 
         # Text-based files
         if ext in SUPPORTED_TEXT_EXTENSIONS:
@@ -451,7 +577,7 @@ class AIMindsEngine:
                 return {"status": "skipped", "reason": "empty_content"}
             return self.ingest_text(
                 text=text, source=str(path), modality=f"file_{ext.strip('.')}",
-                metadata={"source_path": str(path), "extension": ext, "source_type": "file"},
+                metadata={"source_path": str(path), "extension": ext, "source_type": "file", **file_ts},
             )
 
         # Images
@@ -471,6 +597,7 @@ class AIMindsEngine:
                     "extension": ext,
                     "source_type": "file",
                     "media_type": media_kind,
+                    **file_ts,
                 },
             )
 
@@ -483,7 +610,7 @@ class AIMindsEngine:
         meta = {
             "source_path": str(path), "extension": path.suffix.lower(),
             "modality": "image", "source": str(path), "source_type": "file",
-            "category": _categorize(surrogate, {"source_path": str(path)}),
+            "category": _categorize_rules(surrogate, {"source_path": str(path)}),
             "summary": f"Image file: {filename}",
         }
         doc_id = str(uuid.uuid4())
@@ -506,6 +633,7 @@ class AIMindsEngine:
                         ids=[doc_id], documents=[surrogate],
                         embeddings=emb, metadatas=[meta],
                     )
+                    self._bm25_rebuild()
         else:
             emb = self.text_model.encode([surrogate], normalize_embeddings=True).tolist()
             with self.lock:
@@ -513,6 +641,7 @@ class AIMindsEngine:
                     ids=[doc_id], documents=[surrogate],
                     embeddings=emb, metadatas=[meta],
                 )
+                self._bm25_rebuild()
 
         self._store_record(doc_id, "image", meta["category"], meta["summary"],
                            str(path), meta, [])
@@ -521,16 +650,19 @@ class AIMindsEngine:
 
     # ── Search ─────────────────────────────────────────────────────────────
 
-    def _semantic_search(self, query: str, top_k: int) -> List[Dict]:
+    def _semantic_search(self, query: str, top_k: int, category: Optional[str] = None) -> List[Dict]:
         emb = self.text_model.encode([query], normalize_embeddings=True).tolist()
         n_available = self.text_collection.count()
         if n_available == 0:
             return []
         actual_k = min(top_k, n_available)
-        result = self.text_collection.query(
+        query_kwargs = dict(
             query_embeddings=emb, n_results=actual_k,
             include=["documents", "metadatas", "distances", "embeddings"],
         )
+        if category:
+            query_kwargs["where"] = {"category": category}
+        result = self.text_collection.query(**query_kwargs)
         out = []
         ids = result.get("ids", [[]])[0]
         docs = result.get("documents", [[]])[0]
@@ -548,28 +680,42 @@ class AIMindsEngine:
             })
         return out
 
-    def _lexical_search(self, query: str, top_k: int) -> List[Dict]:
+    def _lexical_search(self, query: str, top_k: int, category: Optional[str] = None) -> List[Dict]:
         if not self.bm25_index or not self.doc_id_order:
             return []
         tokens = _normalize_tokens(query)
         if not tokens:
             return []
         scores = self.bm25_index.get_scores(tokens)
-        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
         results = []
         for idx, score in ranked:
             if score <= 0:
                 continue
             doc_id = self.doc_id_order[idx]
+            # If category filter is set, check the doc's metadata in ChromaDB
+            if category:
+                try:
+                    meta = self.text_collection.get(ids=[doc_id], include=["metadatas"])
+                    doc_cat = (meta.get("metadatas") or [{}])[0].get("category", "")
+                    if doc_cat != category:
+                        continue
+                except Exception:
+                    continue
             results.append({"id": doc_id, "score": float(score)})
+            if len(results) >= top_k:
+                break
         return results
 
-    def _hybrid_search(self, query: str, top_k: int = 6) -> List[Dict]:
-        """Combine semantic + lexical search with MMR reranking."""
+    def _hybrid_search(self, query: str, top_k: int = 6, category: Optional[str] = None,
+                       date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict]:
+        """Combine semantic + lexical search with MMR reranking.
+        If category is provided, only results from that category are returned.
+        date_from/date_to: ISO date strings to filter by ingestion date."""
         fetch_k = top_k * 5
 
-        sem_results = self._semantic_search(query, fetch_k)
-        lex_results = self._lexical_search(query, fetch_k)
+        sem_results = self._semantic_search(query, fetch_k, category=category)
+        lex_results = self._lexical_search(query, fetch_k, category=category)
 
         # Keep raw semantic scores for confidence (before normalization)
         # Normalize semantic scores for ranking
@@ -615,6 +761,35 @@ class AIMindsEngine:
                 except Exception:
                     continue
 
+        # ── Date-period filtering ──
+        if date_from or date_to:
+            from_epoch = _parse_iso_to_epoch(date_from) if date_from else 0.0
+            to_epoch = _parse_iso_to_epoch(date_to) if date_to else float("inf")
+            filtered = {}
+            for doc_id, item in combined.items():
+                meta = item.get("metadata", {})
+                item_epoch = float(meta.get("ingested_at_epoch", 0) or meta.get("file_modified_epoch", 0) or 0)
+                if item_epoch == 0:
+                    # Fallback: try parsing ingested_at string
+                    item_epoch = _parse_iso_to_epoch(meta.get("ingested_at", ""))
+                if from_epoch <= item_epoch <= to_epoch:
+                    filtered[doc_id] = item
+            combined = filtered
+
+        # ── Time-decay boost ──
+        decay_enabled = self.config.get("time_decay_enabled", True)
+        half_life = float(self.config.get("time_decay_half_life_days", 30))
+        if decay_enabled:
+            decay_weight = float(self.config.get("time_decay_weight", 0.15))
+            for doc_id, item in combined.items():
+                meta = item.get("metadata", {})
+                created_epoch = float(meta.get("ingested_at_epoch", 0) or meta.get("file_modified_epoch", 0) or 0)
+                if created_epoch <= 0:
+                    created_epoch = _parse_iso_to_epoch(meta.get("ingested_at", ""))
+                decay = _time_decay_weight(created_epoch, half_life)
+                # Blend: (1 - decay_weight) * relevance_score + decay_weight * decay
+                item["score"] = (1 - decay_weight) * item["score"] + decay_weight * decay
+
         ranked = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
 
         # MMR reranking for diversity
@@ -647,14 +822,228 @@ class AIMindsEngine:
 
         return [results[i] for i in selected]
 
+    # ── Smart Query Pre-processing ─────────────────────────────────────────
+
+    def extract_query_params(self, query: str, has_image: bool = False) -> Dict[str, Any]:
+        """Use the LLM to semantically extract date range, category, and image intent
+        from a natural language query. Falls back to empty/defaults if LLM unavailable.
+
+        Returns dict with keys:
+          - category: str or None
+          - date_from: ISO string or None
+          - date_to: ISO string or None
+          - image_intent: str or None  (find_similar | describe | ingest | text_query_with_image)
+          - cleaned_query: str (the actual question without date/category noise)
+        """
+        result = {
+            "category": None,
+            "date_from": None,
+            "date_to": None,
+            "image_intent": None,
+            "cleaned_query": query,
+        }
+
+        llm_cfg = self.config.get("ollama", {})
+        if not llm_cfg.get("enabled", False):
+            # Rule-based fallback for image intent
+            if has_image:
+                result["image_intent"] = _image_intent_fallback(query)
+            return result
+
+        base_url = llm_cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
+        model = llm_cfg.get("model", "qwen2.5:3b")
+
+        today = time.strftime("%Y-%m-%d")
+        image_section = ""
+        if has_image:
+            image_section = (
+                '\n- "image_intent": one of "find_similar", "describe", "ingest", "text_query_with_image"'
+                "\n  find_similar = user wants to find visually similar images in memory"
+                "\n  describe = user wants a description/analysis of what's in the image"
+                "\n  ingest = user just wants to save/store the image"
+                "\n  text_query_with_image = user is asking a text question and the image is supplementary context"
+            )
+
+        prompt = (
+            f"Today's date is {today}.\n"
+            "Extract structured parameters from the user's query below.\n"
+            "Return ONLY a valid JSON object with these keys:\n"
+            '- "category": one of [work, learning, finance, health, personal, news, code] or null if not implied\n'
+            '- "date_from": ISO date string (YYYY-MM-DD) or null. Convert relative dates like "3 months ago", "last week", "yesterday" to absolute dates.\n'
+            '- "date_to": ISO date string (YYYY-MM-DD) or null. If the user says "3 months ago" this is today\'s date.\n'
+            f'{image_section}\n'
+            '- "cleaned_query": the core question without date/category qualifiers, keep the user\'s intent\n\n'
+            "IMPORTANT: Output ONLY the JSON, no explanation, no markdown fences.\n\n"
+            f"User query: {query}"
+        )
+
+        try:
+            import requests as _req
+            resp = _req.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"temperature": 0.0, "num_predict": 200},
+                },
+                timeout=12,
+            )
+            if resp.ok:
+                raw = resp.json().get("message", {}).get("content", "").strip()
+                # Try to extract JSON from response (handle markdown fences)
+                # First try the full response, then look for JSON block
+                json_str = None
+                # Remove markdown fences if present
+                clean = re.sub(r"```json\s*", "", raw)
+                clean = re.sub(r"```\s*", "", clean).strip()
+                try:
+                    parsed = json.loads(clean)
+                    json_str = clean
+                except (json.JSONDecodeError, ValueError):
+                    # Try to find a JSON object in the response
+                    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group()
+
+                if json_str:
+                    try:
+                        parsed = json.loads(json_str)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = {}
+
+                    # Validate category
+                    cat = parsed.get("category")
+                    if cat and cat in VALID_CATEGORIES and cat != "general":
+                        result["category"] = cat
+
+                    # Validate dates
+                    df = parsed.get("date_from")
+                    if df and re.match(r"\d{4}-\d{2}-\d{2}", str(df)):
+                        result["date_from"] = str(df) + "T00:00:00Z"
+
+                    dt = parsed.get("date_to")
+                    if dt and re.match(r"\d{4}-\d{2}-\d{2}", str(dt)):
+                        result["date_to"] = str(dt) + "T23:59:59Z"
+
+                    # Validate image intent
+                    img_intent = parsed.get("image_intent")
+                    if img_intent and img_intent in IMAGE_INTENTS:
+                        result["image_intent"] = img_intent
+
+                    cq = parsed.get("cleaned_query")
+                    if cq and isinstance(cq, str) and len(cq.strip()) > 2:
+                        result["cleaned_query"] = cq.strip()
+
+        except Exception as e:
+            print(f"[engine] Query param extraction failed: {e}")
+
+        # Fallback for image intent if LLM didn't return one
+        if has_image and not result["image_intent"]:
+            result["image_intent"] = _image_intent_fallback(query)
+
+        return result
+
+    def smart_query(self, query: str, image_path: Optional[str] = None,
+                    persist_image: bool = False) -> Dict[str, Any]:
+        """Smart query endpoint — uses LLM to understand the full intent:
+        - Extracts date range, category, and image intent semantically
+        - Routes image operations based on detected intent
+        - Returns unified answer with all results merged
+        """
+        has_image = bool(image_path)
+
+        # Step 1: LLM extracts structured params from natural language
+        params = self.extract_query_params(query, has_image=has_image)
+
+        # Step 2: Run text RAG with extracted params
+        text_result = self.answer(
+            query=params["cleaned_query"],
+            category=params.get("category"),
+            date_from=params.get("date_from"),
+            date_to=params.get("date_to"),
+        )
+
+        # Step 3: Handle image based on detected intent
+        image_result = None
+        image_intent = params.get("image_intent")
+
+        if has_image and image_path:
+            if image_intent == "find_similar":
+                image_result = self.find_similar_images(image_path=image_path, top_k=6)
+            elif image_intent == "describe":
+                # Use CLIP to find similar images + use text model to provide context
+                image_result = self.find_similar_images(image_path=image_path, top_k=3)
+                if image_result.get("status") == "ok":
+                    image_result["answer"] = (
+                        "Image analysis (via visual similarity search):\n"
+                        + image_result.get("answer", "")
+                        + "\n\nNote: For detailed image descriptions, a vision-language model "
+                        "(e.g. llava) is needed. Currently using CLIP similarity matching."
+                    )
+            elif image_intent == "ingest":
+                ingest_result = self.ingest_file(image_path)
+                image_result = {
+                    "status": ingest_result.get("status", "ok"),
+                    "answer": f"Image saved to memory. Category: {ingest_result.get('category', 'general')}",
+                    "references": [],
+                }
+            elif image_intent == "text_query_with_image":
+                # Image is supplementary — do both text query and visual search
+                image_result = self.find_similar_images(image_path=image_path, top_k=3)
+
+            # Optionally persist image
+            if persist_image and image_intent != "ingest":
+                self.ingest_file(image_path)
+
+        # Step 4: Merge results
+        answer_parts = []
+        all_refs = []
+        confidence = 0.0
+        uncertainty = None
+
+        if text_result:
+            answer_parts.append(text_result.get("answer", ""))
+            all_refs.extend(text_result.get("references", []) or [])
+            confidence = max(confidence, float(text_result.get("confidence", 0) or 0))
+            uncertainty = text_result.get("uncertainty")
+
+        if isinstance(image_result, dict) and image_result.get("status") == "ok":
+            img_answer = image_result.get("answer", "")
+            if img_answer:
+                answer_parts.append(img_answer)
+            all_refs.extend(image_result.get("references", []) or [])
+            confidence = max(confidence, float(image_result.get("confidence", 0) or 0))
+
+        final_answer = "\n\n".join([p for p in answer_parts if p]).strip() or "No answer found."
+
+        return {
+            "query": query,
+            "cleaned_query": params["cleaned_query"],
+            "extracted_params": {
+                "category": params.get("category"),
+                "date_from": params.get("date_from"),
+                "date_to": params.get("date_to"),
+                "image_intent": image_intent,
+            },
+            "answer": final_answer,
+            "confidence": round(confidence, 4),
+            "uncertainty": uncertainty,
+            "references": all_refs,
+        }
+
     # ── Answering ──────────────────────────────────────────────────────────
 
-    def answer(self, query: str, top_k: Optional[int] = None) -> Dict[str, Any]:
-        """Full RAG pipeline: search → context → Ollama LLM → grounded answer."""
+    def answer(self, query: str, top_k: Optional[int] = None, category: Optional[str] = None,
+               date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """Full RAG pipeline: search → context → Ollama LLM → grounded answer.
+        If category is provided, retrieval is scoped to that category only.
+        date_from/date_to: ISO date strings for time filtering."""
         k = int(top_k or self.config.get("top_k", 6))
         intent = _intent_from_query(query)
 
-        results = self._hybrid_search(query, k)
+        results = self._hybrid_search(query, k, category=category,
+                                       date_from=date_from, date_to=date_to)
         confidence = self._confidence(results)
 
         # Try Ollama LLM
@@ -673,13 +1062,17 @@ class AIMindsEngine:
         for item in results:
             if float(item.get("score", 0)) < source_threshold:
                 continue
+            meta = item.get("metadata", {})
             references.append({
-                "source": item.get("metadata", {}).get("source", "unknown"),
-                "source_type": item.get("metadata", {}).get("source_type", "unknown"),
-                "category": item.get("metadata", {}).get("category", "general"),
-                "modality": item.get("metadata", {}).get("modality", "text"),
+                "source": meta.get("source", "unknown"),
+                "source_type": meta.get("source_type", "unknown"),
+                "category": meta.get("category", "general"),
+                "modality": meta.get("modality", "text"),
                 "snippet": (item.get("documents") or "")[:240],
                 "score": round(item.get("score", 0), 4),
+                "ingested_at": meta.get("ingested_at", ""),
+                "file_created_at": meta.get("file_created_at", ""),
+                "file_modified_at": meta.get("file_modified_at", ""),
             })
 
         return {
@@ -747,18 +1140,21 @@ class AIMindsEngine:
         model = llm_cfg.get("model", "qwen2.5:3b")
         base_url = llm_cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
 
-        # Build context from search results
+        # Build context from search results (include category + timestamp for grounding)
         context_parts = []
         for i, r in enumerate(results[:6]):
-            source = r.get("metadata", {}).get("source", "unknown")
+            meta = r.get("metadata", {})
+            source = meta.get("source", "unknown")
+            cat = meta.get("category", "general")
+            ingested = meta.get("ingested_at", meta.get("file_modified_at", "unknown"))
             text = r.get("documents", "")[:400]
-            context_parts.append(f"[{i+1}] Source: {source}\n{text}")
+            context_parts.append(f"[{i+1}] Source: {source} | Category: {cat} | Date: {ingested}\n{text}")
         context = "\n\n".join(context_parts)
 
         system_prompt = (
             "You are GigaMind, a personal knowledge assistant. "
             "Answer the user's question using the provided context from their stored memories. "
-            "The context snippets come from different sources (web pages, notes, files). "
+            "The context snippets come from different sources (web pages, notes, files) and have categories. "
             "Be helpful: if context is available, synthesize a clear answer. "
             "Reference which source number(s) support your answer using [1], [2] etc. "
             "If the context doesn't contain enough info, say so honestly. "
@@ -800,10 +1196,12 @@ class AIMindsEngine:
         except Exception as e:
             return None, f"Ollama not reachable: {e}"
 
-    def ollama_stream(self, query: str, top_k: Optional[int] = None):
+    def ollama_stream(self, query: str, top_k: Optional[int] = None, category: Optional[str] = None,
+                      date_from: Optional[str] = None, date_to: Optional[str] = None):
         """Streaming version of answer — yields chunks for real-time UI."""
         k = int(top_k or self.config.get("top_k", 6))
-        results = self._hybrid_search(query, k)
+        results = self._hybrid_search(query, k, category=category,
+                                       date_from=date_from, date_to=date_to)
 
         llm_cfg = self.config.get("ollama", {})
         if not llm_cfg.get("enabled", False):
@@ -815,9 +1213,12 @@ class AIMindsEngine:
 
         context_parts = []
         for i, r in enumerate(results[:6]):
-            source = r.get("metadata", {}).get("source", "unknown")
+            meta = r.get("metadata", {})
+            source = meta.get("source", "unknown")
+            cat = meta.get("category", "general")
+            ingested = meta.get("ingested_at", meta.get("file_modified_at", "unknown"))
             text = r.get("documents", "")[:400]
-            context_parts.append(f"[{i+1}] Source: {source}\n{text}")
+            context_parts.append(f"[{i+1}] Source: {source} | Category: {cat} | Date: {ingested}\n{text}")
         context = "\n\n".join(context_parts)
 
         system_prompt = self.config.get("system_prompt", (
@@ -1292,3 +1693,85 @@ class AIMindsEngine:
         except Exception:
             pass
         return f"Recent activity:\n{context}"
+    # ── Purge All Data ─────────────────────────────────────────────────────
+
+    def purge_all_data(self) -> Dict[str, Any]:
+        """Delete EVERYTHING the model has learned: ChromaDB collections,
+        SQLite records/actions/chats, BM25 cache, file state.
+        This is a full factory reset of all knowledge."""
+        counts = {
+            "text_chunks_deleted": 0,
+            "image_items_deleted": 0,
+            "records_deleted": 0,
+            "actions_deleted": 0,
+            "chat_sessions_deleted": 0,
+            "chat_messages_deleted": 0,
+        }
+        with self.lock:
+            # 1) Wipe ChromaDB collections
+            try:
+                counts["text_chunks_deleted"] = self.text_collection.count()
+                # Try deleting all IDs instead of dropping collection (more robust)
+                all_ids = self.text_collection.get(include=[])["ids"]
+                if all_ids:
+                    # ChromaDB delete in batches (max ~40k per call)
+                    for i in range(0, len(all_ids), 5000):
+                        self.text_collection.delete(ids=all_ids[i:i+5000])
+            except Exception as e:
+                print(f"[purge] Error wiping text collection: {e}")
+                # Fallback: try drop + recreate
+                try:
+                    self.chroma.delete_collection("ai_minds_text")
+                    self.text_collection = self.chroma.get_or_create_collection(
+                        name="ai_minds_text", metadata={"hnsw:space": "cosine"}
+                    )
+                except Exception as e2:
+                    print(f"[purge] Fallback also failed for text: {e2}")
+
+            try:
+                counts["image_items_deleted"] = self.image_collection.count()
+                all_ids = self.image_collection.get(include=[])["ids"]
+                if all_ids:
+                    for i in range(0, len(all_ids), 5000):
+                        self.image_collection.delete(ids=all_ids[i:i+5000])
+            except Exception as e:
+                print(f"[purge] Error wiping image collection: {e}")
+                try:
+                    self.chroma.delete_collection("ai_minds_image")
+                    self.image_collection = self.chroma.get_or_create_collection(
+                        name="ai_minds_image", metadata={"hnsw:space": "cosine"}
+                    )
+                except Exception as e2:
+                    print(f"[purge] Fallback also failed for images: {e2}")
+
+            # 2) Wipe SQLite tables
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    for table in ["actions", "chat_messages", "chat_sessions", "records", "automations"]:
+                        cur = conn.execute(f"DELETE FROM {table}")
+                        key = f"{table}_deleted"
+                        if key in counts:
+                            counts[key] = int(cur.rowcount or 0)
+                    conn.commit()
+            except Exception as e:
+                print(f"[purge] Error wiping SQLite: {e}")
+
+            # 3) Delete BM25 cache
+            try:
+                if self.bm25_path.exists():
+                    self.bm25_path.unlink()
+                self.bm25_index = None
+                self.doc_id_order = []
+                self.doc_token_corpus = []
+            except Exception as e:
+                print(f"[purge] Error deleting BM25 cache: {e}")
+
+            # 4) Reset file state
+            try:
+                if self.file_state_path.exists():
+                    self.file_state_path.unlink()
+            except Exception as e:
+                print(f"[purge] Error resetting file state: {e}")
+
+        print("[purge] All data has been wiped.")
+        return {"status": "ok", **counts}
